@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rush Hour Kitchen</title>
+<style>
+  body { margin: 0; background: #2b2118; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: Arial, sans-serif; }
+  h1 { color: #ffd9a0; margin: 0 0 8px 0; font-size: 20px; letter-spacing: 2px; }
+  canvas { background: #fff7e8; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); cursor: pointer; }
+  p { color: #cbb59a; font-size: 13px; margin: 10px 0 0 0; }
+</style>
+</head>
+<body>
+<h1>RUSH HOUR KITCHEN</h1>
+<canvas id="game" width="960" height="600"></canvas>
+<p>Click ingredients to build dishes &middot; Patties cook on the grill, soup simmers in the pot &middot; Serve before patience runs out! Keys: 1-6 ingredients, Space serve, C clear, P pause.</p>
+<script>
+"use strict";
+var cv = document.getElementById("game");
+var ctx = cv.getContext("2d");
+var W = 960, H = 600;
+var hot = [];
+var shake = 0;
+
+/* ---------------- data ---------------- */
+var RECIPES = {
+  burger: { name: "Burger", price: 8, needs: ["Bun", "Patty", "Cheese"] },
+  salad:  { name: "Salad",  price: 6, needs: ["Lettuce", "Tomato"] },
+  soup:   { name: "Soup",   price: 7, needs: ["Soup"] }
+};
+var RECIPE_KEYS = ["burger", "salad", "soup"];
+var INGREDIENTS = [
+  { id: "Bun",     label: "Bun" },
+  { id: "Patty",   label: "Patty -> grill" },
+  { id: "Lettuce", label: "Lettuce" },
+  { id: "Tomato",  label: "Tomato" },
+  { id: "Cheese",  label: "Cheese" },
+  { id: "Bowl",    label: "Soup Bowl -> pot" }
+];
+var LEVEL_TIME = 90;
+var LEVEL_CFG = {
+  1: { spawn: 9,   patience: 45, pattyTime: 4,   soupTime: 5 },
+  2: { spawn: 7,   patience: 38, pattyTime: 4,   soupTime: 5 },
+  3: { spawn: 5.5, patience: 32, pattyTime: 3.5, soupTime: 4.5 }
+};
+
+/* ---------------- state ---------------- */
+var screen = "menu"; /* menu | playing | paused | leveldone | gameover */
+var level = 1, timeLeft = LEVEL_TIME, coins = 0, score = 0;
+var served = 0, failed = 0, combo = 0, hearts = 3;
+var orders = [], plate = [];
+var grill = [null, null]; /* {t, dur, state: cooking|done|burnt, doneT} */
+var pot = null;           /* {t, dur, state: cooking|done|burnt, doneT} */
+var msg = "", msgT = 0, spawnT = 1, orderId = 0, flash = 0;
+
+function cfg() { return LEVEL_CFG[level]; }
+function setMsg(s) { msg = s; msgT = 3; }
+
+/* ---------------- audio (tiny beeps) ---------------- */
+var AC = null;
+function beep(f, d) {
+  try {
+    if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = "sine"; o.frequency.value = f; g.gain.value = 0.07;
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + d);
+  } catch (e) { /* sound is optional */ }
+}
+
+/* ---------------- flow ---------------- */
+function resetAll(lv) {
+  level = lv; timeLeft = LEVEL_TIME; coins = 0; score = 0;
+  served = 0; failed = 0; combo = 0; hearts = 3;
+  orders = []; plate = []; grill = [null, null]; pot = null;
+  spawnT = 1; msg = ""; msgT = 0;
+}
+function startGame() { resetAll(1); screen = "playing"; beep(660, 0.12); }
+function nextLevel() {
+  level++; timeLeft = LEVEL_TIME;
+  orders = []; plate = []; grill = [null, null]; pot = null;
+  spawnT = 1; screen = "playing"; beep(880, 0.12);
+}
+function doLevelDone() {
+  coins += 10; score += 100;
+  setMsg("Level " + level + " complete! +$10 bonus");
+  screen = "leveldone"; beep(990, 0.2);
+}
+function doGameOver() { msg = ""; msgT = 0; screen = "gameover"; beep(220, 0.4); }
+function spawnOrder() {
+  var key = RECIPE_KEYS[Math.floor(Math.random() * RECIPE_KEYS.length)];
+  var r = RECIPES[key];
+  orders.push({ id: ++orderId, key: key, name: r.name, price: r.price,
+    needs: r.needs.slice(), patience: cfg().patience, max: cfg().patience });
+}
+
+/* ---------------- actions ---------------- */
+function addToPlate(id) {
+  if (plate.length >= 4) { setMsg("Plate is full! Serve or clear it."); beep(160, 0.15); return; }
+  plate.push(id); beep(520, 0.07);
+}
+function clickIngredient(id) {
+  if (screen !== "playing") return;
+  if (id === "Patty") {
+    for (var i = 0; i < grill.length; i++) {
+      if (!grill[i]) { grill[i] = { t: 0, dur: cfg().pattyTime, state: "cooking", doneT: 0 }; beep(440, 0.07); return; }
+    }
+    setMsg("Grill is full! Wait for a patty to finish."); beep(160, 0.15); return;
+  }
+  if (id === "Bowl") {
+    if (!pot) { pot = { t: 0, dur: cfg().soupTime, state: "cooking", doneT: 0 }; beep(440, 0.07); return; }
+    setMsg("Pot is busy! Wait for the soup."); beep(160, 0.15); return;
+  }
+  addToPlate(id);
+}
+function clickGrill(i) {
+  var g = grill[i];
+  if (!g) return;
+  if (g.state === "done") { grill[i] = null; addToPlate("Patty"); }
+  else if (g.state === "burnt") { grill[i] = null; setMsg("Burnt patty trashed!"); beep(160, 0.15); }
+  else setMsg("Still cooking... wait for the ding!");
+}
+function clickPot() {
+  if (!pot) return;
+  if (pot.state === "done") { pot = null; addToPlate("Soup"); }
+  else if (pot.state === "burnt") { pot = null; setMsg("Burnt soup trashed!"); beep(160, 0.15); }
+  else setMsg("Still simmering... wait for the ding!");
+}
+function servePlate() {
+  if (screen !== "playing") return;
+  if (plate.length === 0) { setMsg("Plate is empty - add ingredients first!"); beep(160, 0.15); return; }
+  var key = plate.slice().sort().join(",");
+  var idx = -1;
+  for (var i = 0; i < orders.length; i++) {
+    if (orders[i].needs.slice().sort().join(",") === key) { idx = i; break; }
+  }
+  if (idx < 0) { setMsg("No order matches this plate!"); combo = 0; shake = 8; beep(160, 0.25); return; }
+  var o = orders[idx]; orders.splice(idx, 1);
+  var tip = Math.round(3 * o.patience / o.max);
+  combo++;
+  var earn = o.price + tip + (combo - 1);
+  coins += earn; score += earn * 10 + 50; served++; flash = 10;
+  setMsg(o.name + " served! +$" + earn + (combo > 1 ? "  Combo x" + combo + "!" : ""));
+  plate = []; beep(880, 0.15);
+}
+function clearPlate() { if (plate.length) { plate = []; setMsg("Plate cleared."); } }
+
+/* ---------------- update ---------------- */
+function update(dt) {
+  if (screen !== "playing") return;
+  if (shake > 0) shake--;
+  if (flash > 0) flash--;
+  timeLeft -= dt;
+  if (timeLeft <= 0) {
+    timeLeft = 0;
+    if (level >= 3) { doGameOver(); return; }
+    doLevelDone(); return;
+  }
+  spawnT -= dt;
+  if (spawnT <= 0 && orders.length < 3) { spawnOrder(); spawnT = cfg().spawn; }
+  for (var i = orders.length - 1; i >= 0; i--) {
+    orders[i].patience -= dt;
+    if (orders[i].patience <= 0) {
+      orders.splice(i, 1); hearts--; failed++; combo = 0;
+      setMsg("A customer walked out! -1 heart"); beep(160, 0.25); shake = 8;
+      if (hearts <= 0) { doGameOver(); return; }
+    }
+  }
+  for (var g = 0; g < grill.length; g++) {
+    var s = grill[g];
+    if (!s) continue;
+    if (s.state === "cooking") { s.t += dt; if (s.t >= s.dur) { s.state = "done"; beep(660, 0.12); } }
+    else if (s.state === "done") { s.doneT += dt; if (s.doneT > 6) s.state = "burnt"; }
+  }
+  if (pot) {
+    if (pot.state === "cooking") { pot.t += dt; if (pot.t >= pot.dur) { pot.state = "done"; beep(660, 0.12); } }
+    else if (pot.state === "done") { pot.doneT += dt; if (pot.doneT > 6) pot.state = "burnt"; }
+  }
+  if (msgT > 0) msgT -= dt;
+}
+
+/* ---------------- drawing helpers ---------------- */
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function text(s, x, y, size, color, align, bold) {
+  ctx.fillStyle = color;
+  ctx.font = (bold ? "bold " : "") + size + "px Arial, sans-serif";
+  ctx.textAlign = align || "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(s, x, y);
+}
+function button(x, y, w, h, label, bg, fg, size) {
+  ctx.fillStyle = bg; rr(x, y, w, h, 10); ctx.fill();
+  ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = 2; rr(x, y, w, h, 10); ctx.stroke();
+  text(label, x + w / 2, y + h / 2 + 1, size || 18, fg || "#fff", "center", true);
+  hot.push({ x: x, y: y, w: w, h: h, label: label });
+  return hot[hot.length - 1];
+}
+function drawHeart(cx, cy, s, filled) {
+  ctx.fillStyle = filled ? "#e23b2e" : "#d8c9b8";
+  ctx.beginPath();
+  ctx.arc(cx - s * 0.35, cy - s * 0.15, s * 0.38, 0, Math.PI * 2);
+  ctx.arc(cx + s * 0.35, cy - s * 0.15, s * 0.38, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(cx - s * 0.68, cy);
+  ctx.lineTo(cx + s * 0.68, cy);
+  ctx.lineTo(cx, cy + s * 0.75);
+  ctx.closePath(); ctx.fill();
+}
+function drawIngredient(id, cx, cy, s) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  if (id === "Bun") {
+    ctx.fillStyle = "#e8a85c";
+    ctx.beginPath(); ctx.arc(0, 0, s, Math.PI, 0); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#f2c078"; ctx.fillRect(-s, 0, s * 2, s * 0.5);
+    ctx.fillStyle = "#fff3d6";
+    ctx.fillRect(-s * 0.55, -s * 0.55, 3, 3);
+    ctx.fillRect(0, -s * 0.7, 3, 3);
+    ctx.fillRect(s * 0.45, -s * 0.4, 3, 3);
+  } else if (id === "Patty") {
+    ctx.fillStyle = "#7a4a21"; rr(-s, -s * 0.45, s * 2, s * 0.9, s * 0.4); ctx.fill();
+    ctx.fillStyle = "#8d5a2b"; rr(-s * 0.8, -s * 0.45, s * 1.6, s * 0.35, s * 0.2); ctx.fill();
+  } else if (id === "Lettuce") {
+    ctx.fillStyle = "#5da93c";
+    ctx.beginPath(); ctx.arc(-s * 0.4, 0, s * 0.55, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(s * 0.4, 0, s * 0.55, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#7ec850";
+    ctx.beginPath(); ctx.arc(0, -s * 0.15, s * 0.6, 0, Math.PI * 2); ctx.fill();
+  } else if (id === "Tomato") {
+    ctx.fillStyle = "#e23b2e";
+    ctx.beginPath(); ctx.arc(0, s * 0.1, s * 0.8, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#7ec850";
+    ctx.fillRect(-s * 0.15, -s * 0.85, s * 0.3, s * 0.4);
+    ctx.beginPath(); ctx.ellipse(0, -s * 0.55, s * 0.45, s * 0.2, 0, 0, Math.PI * 2); ctx.fill();
+  } else if (id === "Cheese") {
+    ctx.fillStyle = "#ffd23e";
+    ctx.beginPath(); ctx.moveTo(-s, s * 0.6); ctx.lineTo(s, s * 0.6); ctx.lineTo(0, -s * 0.7); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#f0a500";
+    ctx.beginPath(); ctx.arc(-s * 0.25, s * 0.15, s * 0.12, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(s * 0.3, s * 0.3, s * 0.12, 0, Math.PI * 2); ctx.fill();
+  } else if (id === "Bowl" || id === "Soup") {
+    ctx.fillStyle = "#3f6fb5";
+    ctx.beginPath(); ctx.arc(0, -s * 0.1, s * 0.85, 0, Math.PI); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = id === "Soup" ? "#ff8c42" : "#f7e8c8";
+    ctx.beginPath(); ctx.ellipse(0, -s * 0.1, s * 0.85, s * 0.3, 0, 0, Math.PI * 2); ctx.fill();
+    if (id === "Soup") {
+      ctx.strokeStyle = "#cbb59a"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(-s * 0.4, -s * 0.9); ctx.quadraticCurveTo(-s * 0.2, -s * 1.3, -s * 0.4, -s * 1.6); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(s * 0.3, -s * 0.9); ctx.quadraticCurveTo(s * 0.5, -s * 1.3, s * 0.3, -s * 1.6); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+function fmtTime(t) {
+  var m = Math.floor(t / 60), s = Math.floor(t % 60);
+  return m + ":" + (s < 10 ? "0" : "") + s;
+}
+
+/* ---------------- screens ---------------- */
+function drawHeader() {
+  ctx.fillStyle = "#3b2d20"; ctx.fillRect(0, 0, W, 54);
+  text("RUSH HOUR KITCHEN", 16, 28, 21, "#ffd9a0", "left", true);
+  text("Level " + level + "/3", 300, 28, 16, "#fff", "left", true);
+  text("Time " + fmtTime(timeLeft), 400, 28, 16, timeLeft <= 10 ? "#ff6b5e" : "#fff", "left", true);
+  text("Coins $" + coins, 520, 28, 16, "#ffd23e", "left", true);
+  text("Score " + score, 640, 28, 16, "#fff", "left", true);
+  for (var i = 0; i < 3; i++) drawHeart(770 + i * 30, 27, 11, i < hearts);
+  if (screen === "playing" || screen === "paused") {
+    var b = button(886, 9, 58, 36, screen === "paused" ? "▶" : "II", "#e2703a", "#fff", 16);
+    b.action = "pause";
+  }
+}
+function drawOrders() {
+  text("ORDERS", 16, 74, 14, "#8a6d4b", "left", true);
+  for (var i = 0; i < 3; i++) {
+    var x = 16 + i * 312, y = 86, w = 296, h = 76;
+    if (i < orders.length) {
+      var o = orders[i];
+      ctx.fillStyle = "#fff"; rr(x, y, w, h, 10); ctx.fill();
+      ctx.strokeStyle = "#e8d5b5"; ctx.lineWidth = 2; rr(x, y, w, h, 10); ctx.stroke();
+      text(o.name + "  $" + o.price, x + 14, y + 22, 17, "#3b2d20", "left", true);
+      text("#" + o.id, x + w - 14, y + 22, 13, "#b09a7e", "right", false);
+      for (var j = 0; j < o.needs.length; j++) drawIngredient(o.needs[j], x + 30 + j * 44, y + 52, 15);
+      var pct = Math.max(0, o.patience / o.max);
+      ctx.fillStyle = "#eee"; rr(x + 150, y + 44, 130, 12, 6); ctx.fill();
+      ctx.fillStyle = pct > 0.5 ? "#58b368" : (pct > 0.25 ? "#f0a13a" : "#e23b2e");
+      if (pct > 0) { rr(x + 150, y + 44, 130 * pct, 12, 6); ctx.fill(); }
+      text(Math.ceil(o.patience) + "s", x + 150, y + 68, 12, "#8a6d4b", "left", false);
+    } else {
+      ctx.strokeStyle = "#d8c9b8"; ctx.setLineDash([6, 5]); ctx.lineWidth = 2;
+      rr(x, y, w, h, 10); ctx.stroke(); ctx.setLineDash([]);
+      text("waiting for customers...", x + w / 2, y + h / 2, 14, "#b09a7e", "center", false);
+    }
+  }
+}
+function drawStations() {
+  /* grill */
+  ctx.fillStyle = "#fff"; rr(16, 176, 296, 196, 12); ctx.fill();
+  ctx.strokeStyle = "#e8d5b5"; ctx.lineWidth = 2; rr(16, 176, 296, 196, 12); ctx.stroke();
+  text("GRILL", 32, 200, 15, "#8a6d4b", "left", true);
+  for (var g = 0; g < 2; g++) {
+    var gx = 36 + g * 140, gy = 216, gw = 120, gh = 96;
+    ctx.fillStyle = "#4a4a4a"; rr(gx, gy, gw, gh, 10); ctx.fill();
+    var s = grill[g];
+    if (s) {
+      ctx.strokeStyle = "#333"; ctx.lineWidth = 2;
+      for (var ln = 1; ln < 4; ln++) { ctx.beginPath(); ctx.moveTo(gx + 10, gy + ln * 24); ctx.lineTo(gx + gw - 10, gy + ln * 24); ctx.stroke(); }
+    }
+    if (s) {
+      if (s.state === "burnt") {
+        drawIngredient("Patty", gx + gw / 2, gy + 40, 26);
+        text("BURNT! Click to trash", gx + gw / 2, gy + 82, 11, "#ff8a7a", "center", true);
+      } else {
+        drawIngredient("Patty", gx + gw / 2, gy + 38, 26);
+        var p = Math.min(1, s.t / s.dur);
+        ctx.fillStyle = "#333"; rr(gx + 10, gy + 66, gw - 20, 10, 5); ctx.fill();
+        ctx.fillStyle = s.state === "done" ? "#58b368" : "#f0a13a";
+        if (p > 0) { rr(gx + 10, gy + 66, (gw - 20) * p, 10, 5); ctx.fill(); }
+        text(s.state === "done" ? "READY! Click to plate" : "cooking...", gx + gw / 2, gy + 86, 11, s.state === "done" ? "#58b368" : "#ddd", "center", true);
+      }
+    } else {
+      text("empty slot", gx + gw / 2, gy + 48, 13, "#999", "center", false);
+    }
+    var hb = { x: gx, y: gy, w: gw, h: gh, action: "grill" + g };
+    hot.push(hb);
+  }
+  text("Click a patty (2) to grill it", 32, 348, 12, "#b09a7e", "left", false);
+  /* pot */
+  ctx.fillStyle = "#fff"; rr(332, 176, 296, 196, 12); ctx.fill();
+  ctx.strokeStyle = "#e8d5b5"; ctx.lineWidth = 2; rr(332, 176, 296, 196, 12); ctx.stroke();
+  text("POT", 348, 200, 15, "#8a6d4b", "left", true);
+  ctx.fillStyle = "#4a4a4a"; rr(392, 216, 176, 96, 10); ctx.fill();
+  if (pot) {
+    drawIngredient("Soup", 480, 258, 30);
+    var pp = Math.min(1, pot.t / pot.dur);
+    ctx.fillStyle = "#333"; rr(402, 288, 156, 10, 5); ctx.fill();
+    ctx.fillStyle = pot.state === "done" ? "#58b368" : (pot.state === "burnt" ? "#e23b2e" : "#f0a13a");
+    if (pp > 0) { rr(402, 288, 156 * pp, 10, 5); ctx.fill(); }
+    text(pot.state === "done" ? "SOUP READY! Click to plate" : (pot.state === "burnt" ? "BURNT! Click to trash" : "simmering..."), 480, 330, 12, pot.state === "done" ? "#58b368" : "#8a6d4b", "center", true);
+  } else {
+    text("empty pot", 480, 258, 13, "#999", "center", false);
+  }
+  hot.push({ x: 392, y: 216, w: 176, h: 96, action: "pot" });
+  text("Click a soup bowl (6) to start the pot", 348, 348, 12, "#b09a7e", "left", false);
+  /* plate */
+  ctx.fillStyle = "#fff"; rr(648, 176, 296, 196, 12); ctx.fill();
+  ctx.strokeStyle = "#e8d5b5"; ctx.lineWidth = 2; rr(648, 176, 296, 196, 12); ctx.stroke();
+  text("YOUR PLATE", 664, 200, 15, "#8a6d4b", "left", true);
+  ctx.fillStyle = "#fdf6e3";
+  ctx.beginPath(); ctx.ellipse(796, 262, 118, 52, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "#e8d5b5"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.ellipse(796, 262, 118, 52, 0, 0, Math.PI * 2); ctx.stroke();
+  if (plate.length === 0) {
+    text("plate is empty", 796, 262, 13, "#b09a7e", "center", false);
+  } else {
+    for (var pi = 0; pi < plate.length; pi++) {
+      drawIngredient(plate[pi], 716 + pi * 54, 262, 17);
+    }
+  }
+  var sb = button(668, 322, 128, 40, "SERVE", "#58b368", "#fff", 17);
+  sb.action = "serve";
+  var cb = button(812, 322, 112, 40, "CLEAR", "#b09a7e", "#fff", 15);
+  cb.action = "clear";
+}
+function drawIngredients() {
+  text("INGREDIENTS  —  click to add to your plate (Patty goes to the grill, Soup Bowl goes to the pot)", 16, 396, 13, "#8a6d4b", "left", true);
+  for (var i = 0; i < INGREDIENTS.length; i++) {
+    var x = 16 + i * 154, y = 410, w = 140, h = 92;
+    ctx.fillStyle = "#fff"; rr(x, y, w, h, 10); ctx.fill();
+    ctx.strokeStyle = "#e8d5b5"; ctx.lineWidth = 2; rr(x, y, w, h, 10); ctx.stroke();
+    var ing = INGREDIENTS[i];
+    drawIngredient(ing.id === "Bowl" ? "Bowl" : ing.id, x + w / 2, y + 34, 20);
+    text(ing.label, x + w / 2, y + 72, 13, "#3b2d20", "center", true);
+    text("[" + (i + 1) + "]", x + w - 10, y + 14, 11, "#b09a7e", "right", false);
+    hot.push({ x: x, y: y, w: w, h: h, action: "ing" + i });
+  }
+}
+function drawFooter() {
+  if (msgT > 0) text(msg, W / 2, 534, 17, "#3b2d20", "center", true);
+  text("Serve the exact recipe before patience runs out. Tips for fast serves, combos for streaks. 3 levels, 90 seconds each.", W / 2, 566, 13, "#b09a7e", "center", false);
+}
+function drawMenu() {
+  ctx.fillStyle = "#fff7e8"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#e2703a"; rr(180, 60, 600, 130, 16); ctx.fill();
+  text("RUSH HOUR", 480, 108, 46, "#fff", "center", true);
+  text("KITCHEN", 480, 156, 46, "#ffd23e", "center", true);
+  text("Run a tiny kitchen against the clock. Cook, plate, serve - don't keep customers waiting!", 480, 226, 16, "#3b2d20", "center", false);
+  var y = 262;
+  var lines = [
+    "HOW TO PLAY",
+    "1. Orders appear at the top - each shows the dish and its patience bar.",
+    "2. Click ingredients below to build the dish on your plate.",
+    "3. Patties must be grilled first (click Patty, wait for READY, click the grill).",
+    "4. Soup must simmer in the pot (click Soup Bowl, wait for READY, click the pot).",
+    "5. Click SERVE when your plate matches an order. Fast serves earn tips, streaks earn combos.",
+    "6. 3 levels, 90 seconds each. Lose all 3 hearts and the rush is over!"
+  ];
+  for (var i = 0; i < lines.length; i++) {
+    text(lines[i], 480, y, i === 0 ? 17 : 14, i === 0 ? "#e2703a" : "#5a4632", "center", i === 0);
+    y += i === 0 ? 30 : 24;
+  }
+  var b = button(380, 470, 200, 56, "START COOKING", "#58b368", "#fff", 20);
+  b.action = "start";
+  text("Best played with mouse or keys 1-6, Space to serve.", 480, 556, 12, "#b09a7e", "center", false);
+}
+function drawOverlay(title, lines, btnLabel, action, color) {
+  ctx.fillStyle = "rgba(43,33,24,0.72)"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#fff"; rr(230, 130, 500, 300, 16); ctx.fill();
+  text(title, 480, 180, 32, color || "#3b2d20", "center", true);
+  var y = 232;
+  for (var i = 0; i < lines.length; i++) { text(lines[i], 480, y, 16, "#5a4632", "center", false); y += 30; }
+  var b = button(380, 360, 200, 50, btnLabel, "#58b368", "#fff", 19);
+  b.action = action;
+}
+function drawGame() {
+  ctx.fillStyle = "#fff7e8"; ctx.fillRect(0, 0, W, H);
+  if (shake > 0) { ctx.save(); ctx.translate((Math.random() - 0.5) * shake, 0); }
+  drawHeader();
+  drawOrders();
+  drawStations();
+  drawIngredients();
+  drawFooter();
+  if (shake > 0) ctx.restore();
+  if (screen === "paused") {
+    drawOverlay("PAUSED", ["Take a breath. The orders will wait.", "Well... not really. But the timer is stopped."], "RESUME", "pause", "#e2703a");
+  } else if (screen === "leveldone") {
+    drawOverlay("LEVEL " + level + " COMPLETE!",
+      ["Bonus +$10 and +100 score.", "Coins: $" + coins + "   Score: " + score + "   Served: " + served, "Next level: faster orders, shorter patience!"],
+      "NEXT LEVEL", "next", "#58b368");
+  } else if (screen === "gameover") {
+    var best = served >= 12 ? "Head Chef!" : (served >= 6 ? "Solid Sous-Chef!" : "Keep practicing!");
+    drawOverlay("TIME'S UP!",
+      ["Final score: " + score + "   Coins: $" + coins, "Dishes served: " + served + "   Walked out: " + failed, best],
+      "PLAY AGAIN", "restart", "#e2703a");
+  }
+}
+function draw() {
+  hot = [];
+  if (screen === "menu") drawMenu();
+  else drawGame();
+}
+
+/* ---------------- input ---------------- */
+function dispatch(action) {
+  if (action === "start") startGame();
+  else if (action === "pause") { if (screen === "playing") screen = "paused"; else if (screen === "paused") screen = "playing"; }
+  else if (action === "next") nextLevel();
+  else if (action === "restart") startGame();
+  else if (action === "serve") servePlate();
+  else if (action === "clear") clearPlate();
+  else if (action === "pot") clickPot();
+  else if (action.indexOf("grill") === 0) clickGrill(parseInt(action.slice(5), 10));
+  else if (action.indexOf("ing") === 0) clickIngredient(INGREDIENTS[parseInt(action.slice(3), 10)].id);
+}
+cv.addEventListener("click", function (e) {
+  var r = cv.getBoundingClientRect();
+  var x = (e.clientX - r.left) * W / r.width;
+  var y = (e.clientY - r.top) * H / r.height;
+  for (var i = hot.length - 1; i >= 0; i--) {
+    var h = hot[i];
+    if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
+      dispatch(h.action);
+      return;
+    }
+  }
+});
+document.addEventListener("keydown", function (e) {
+  if (screen === "menu" && e.key === "Enter") { startGame(); return; }
+  if (screen === "leveldone" && e.key === "Enter") { nextLevel(); return; }
+  if (screen === "gameover" && e.key === "Enter") { startGame(); return; }
+  if (screen === "playing") {
+    if (e.key >= "1" && e.key <= "6") clickIngredient(INGREDIENTS[parseInt(e.key, 10) - 1].id);
+    else if (e.key === " ") { e.preventDefault(); servePlate(); }
+    else if (e.key === "c" || e.key === "C") clearPlate();
+    else if (e.key === "p" || e.key === "P") screen = "paused";
+  } else if (screen === "paused" && (e.key === "p" || e.key === "P")) {
+    screen = "playing";
+  }
+});
+
+/* ---------------- main loop ---------------- */
+var last = 0;
+function loop(ts) {
+  var dt = Math.min(0.05, (ts - last) / 1000 || 0);
+  last = ts;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+draw();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
